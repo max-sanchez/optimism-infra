@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
@@ -8,6 +9,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"os/signal"
+	rpprof "runtime/pprof"
 	"strconv"
 	"strings"
 	"syscall"
@@ -25,7 +27,22 @@ var (
 	GitDate    = ""
 )
 
+var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to file")
+
 func main() {
+	flag.Parse()
+	if *cpuprofile != "" {
+		fmt.Printf("CPU profiling enabled!")
+		f, _ := os.Create(*cpuprofile)
+		rpprof.StartCPUProfile(f)
+		defer rpprof.StopCPUProfile()
+	} else {
+		fmt.Printf("Auto CPU profiling enabled!")
+		f, _ := os.Create("proxyd.prof")
+		rpprof.StartCPUProfile(f)
+		defer rpprof.StopCPUProfile()
+	}
+
 	// Set up logger with a default INFO level in case we fail to parse flags.
 	// Otherwise the final critical log won't show what the parsing error was.
 	proxyd.SetLogLevel(slog.LevelInfo)
