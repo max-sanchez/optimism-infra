@@ -604,6 +604,7 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 
 	req.Header.SetContentTypeBytes(headerContentTypeJson)
 	req.Header.Set("X-Forwarded-For", xForwardedFor)
+	req.Header.Set("Accept-Encoding", "gzip")
 
 	for name, value := range b.headers {
 		// httpReq.Header.Set(name, value)
@@ -654,7 +655,13 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 	}
 
 	// defer httpRes.Body.Close()
-	resB, err := io.ReadAll(LimitReader(bytes.NewReader(httpRes.Body()), b.maxResponseSize))
+
+	bodyUncomp, err := httpRes.BodyUncompressed()
+	if err != nil {
+		return nil, ErrBackendResponseTooLarge // TODO different error
+	}
+
+	resB, err := io.ReadAll(LimitReader(bytes.NewReader(bodyUncomp), b.maxResponseSize))
 	if errors.Is(err, ErrLimitReaderOverLimit) {
 		return nil, ErrBackendResponseTooLarge
 	}
