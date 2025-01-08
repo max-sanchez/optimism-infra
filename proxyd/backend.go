@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/goccy/go-json"
+	"github.com/valyala/fasthttp"
 	"io"
 	"math"
 	"math/rand"
@@ -141,6 +142,7 @@ type Backend struct {
 	authUsername         string
 	authPassword         string
 	headers              map[string]string
+	fastClient           *fasthttp.Client
 	client               *LimitedHTTPClient
 	dialer               *websocket.Dialer
 	maxRetries           int
@@ -318,11 +320,27 @@ func NewBackend(
 	rpcSemaphore *semaphore.Weighted,
 	opts ...BackendOpt,
 ) *Backend {
+	readTimeout, _ := time.ParseDuration("500ms")
+	writeTimeout, _ := time.ParseDuration("500ms")
+	maxIdleConnDuration, _ := time.ParseDuration("1h")
 	backend := &Backend{
 		Name:            name,
 		rpcURL:          rpcURL,
 		wsURL:           wsURL,
 		maxResponseSize: math.MaxInt64,
+		fastClient: &fasthttp.Client{
+			ReadTimeout:                   readTimeout,
+			WriteTimeout:                  writeTimeout,
+			MaxIdleConnDuration:           maxIdleConnDuration,
+			NoDefaultUserAgentHeader:      true, // Don't send: User-Agent: fasthttp
+			DisableHeaderNamesNormalizing: true, // If you set the case on your headers correctly you can enable this
+			DisablePathNormalizing:        true,
+			// increase DNS cache time to five minutes
+			Dial: (&fasthttp.TCPDialer{
+				Concurrency:      32768,
+				DNSCacheDuration: time.Minute * 5,
+			}).Dial,
+		},
 		client: &LimitedHTTPClient{
 			Client:      http.Client{Timeout: 5 * time.Second},
 			sem:         rpcSemaphore,
@@ -482,6 +500,8 @@ func (b *Backend) ForwardRPC(ctx context.Context, res *RPCRes, id string, method
 	return nil
 }
 
+var headerContentTypeJson = []byte("application/json")
+
 func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool) ([]*RPCRes, error) {
 	// we are concerned about network error rates, so we record 1 request independently of how many are in the batch
 	b.networkRequestsSlidingWindow.Incr()
@@ -550,21 +570,26 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 		body = mustMarshalJSON(rpcReqs)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, "POST", b.rpcURL, bytes.NewReader(body))
-	if err != nil {
-		b.intermittentErrorsSlidingWindow.Incr()
-		RecordBackendNetworkErrorRateSlidingWindow(b, b.ErrorRate())
-		return nil, wrapErr(err, "error creating backend request")
-	}
+	req := fasthttp.AcquireRequest()
+	req.SetRequestURI(b.rpcURL)
+	req.Header.SetMethod(fasthttp.MethodPost)
+	req.SetBody(body)
 
-	if b.authPassword != "" {
-		httpReq.SetBasicAuth(b.authUsername, b.authPassword)
-	}
+	// httpReq, err := http.NewRequestWithContext(ctx, "POST", b.rpcURL, bytes.NewReader(body))
+	// if err != nil {
+	// 	b.intermittentErrorsSlidingWindow.Incr()
+	// 	RecordBackendNetworkErrorRateSlidingWindow(b, b.ErrorRate())
+	// 	return nil, wrapErr(err, "error creating backend request")
+	// }
 
-	opTxProxyAuth := GetOpTxProxyAuthHeader(ctx)
-	if opTxProxyAuth != "" {
-		httpReq.Header.Set(DefaultOpTxProxyAuthHeader, opTxProxyAuth)
-	}
+	// if b.authPassword != "" {
+	// 	httpReq.SetBasicAuth(b.authUsername, b.authPassword)
+	// }
+
+	// opTxProxyAuth := GetOpTxProxyAuthHeader(ctx)
+	// if opTxProxyAuth != "" {
+	// 	httpReq.Header.Set(DefaultOpTxProxyAuthHeader, opTxProxyAuth)
+	// }
 
 	xForwardedFor := GetXForwardedFor(ctx)
 	if b.stripTrailingXFF {
@@ -573,42 +598,62 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 		xForwardedFor = fmt.Sprintf("%s, %s", xForwardedFor, b.proxydIP)
 	}
 
-	httpReq.Header.Set("content-type", "application/json")
-	httpReq.Header.Set("X-Forwarded-For", xForwardedFor)
+	// httpReq.Header.Set("content-type", "application/json")
+	// httpReq.Header.Set("X-Forwarded-For", xForwardedFor)
+
+	req.Header.SetContentTypeBytes(headerContentTypeJson)
+	req.Header.Set("X-Forwarded-For", xForwardedFor)
 
 	for name, value := range b.headers {
-		httpReq.Header.Set(name, value)
+		// httpReq.Header.Set(name, value)
+		req.Header.Set(name, value)
 	}
 
 	start := time.Now()
-	httpRes, err := b.client.DoLimited(httpReq)
+	// httpRes, err := b.client.DoLimited(httpReq)
+	// if err != nil {
+	// 	b.intermittentErrorsSlidingWindow.Incr()
+	// 	RecordBackendNetworkErrorRateSlidingWindow(b, b.ErrorRate())
+	//	return nil, wrapErr(err, "error in backend request")
+	// }
+
+	httpRes := fasthttp.AcquireResponse()
+
+	reqTimeout := time.Duration(100) * time.Millisecond
+
+	err := b.fastClient.DoTimeout(req, httpRes, reqTimeout)
 	if err != nil {
 		b.intermittentErrorsSlidingWindow.Incr()
 		RecordBackendNetworkErrorRateSlidingWindow(b, b.ErrorRate())
-		return nil, wrapErr(err, "error in backend request")
+		return nil, wrapErr(err, "err in backend request")
 	}
+	fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(httpRes)
 
 	metricLabelMethod := rpcReqs[0].Method
 	if isBatch {
 		metricLabelMethod = "<batch>"
 	}
+
+	sc := httpRes.StatusCode()
+
 	rpcBackendHTTPResponseCodesTotal.WithLabelValues(
 		GetAuthCtx(ctx),
 		b.Name,
 		metricLabelMethod,
-		strconv.Itoa(httpRes.StatusCode),
+		strconv.Itoa(sc),
 		strconv.FormatBool(isBatch),
 	).Inc()
 
 	// Alchemy returns a 400 on bad JSONs, so handle that case
-	if httpRes.StatusCode != 200 && httpRes.StatusCode != 400 {
+	if sc != 200 && sc != 400 {
 		b.intermittentErrorsSlidingWindow.Incr()
 		RecordBackendNetworkErrorRateSlidingWindow(b, b.ErrorRate())
 		return nil, fmt.Errorf("response code %d", httpRes.StatusCode)
 	}
 
-	defer httpRes.Body.Close()
-	resB, err := io.ReadAll(LimitReader(httpRes.Body, b.maxResponseSize))
+	// defer httpRes.Body.Close()
+	resB, err := io.ReadAll(LimitReader(bytes.NewReader(httpRes.Body()), b.maxResponseSize))
 	if errors.Is(err, ErrLimitReaderOverLimit) {
 		return nil, ErrBackendResponseTooLarge
 	}
@@ -649,9 +694,9 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 
 	// capture the HTTP status code in the response. this will only
 	// ever be 400 given the status check on line 318 above.
-	if httpRes.StatusCode != 200 {
+	if sc != 200 {
 		for _, res := range rpcRes {
-			res.Error.HTTPErrorCode = httpRes.StatusCode
+			res.Error.HTTPErrorCode = sc
 		}
 	}
 	duration := time.Since(start)
@@ -1317,6 +1362,12 @@ func sleepContext(ctx context.Context, duration time.Duration) {
 	case <-ctx.Done():
 	case <-time.After(duration):
 	}
+}
+
+type FastLimitedHTTPClient struct {
+	Client      fasthttp.Client
+	sem         *semaphore.Weighted
+	backendName string
 }
 
 type LimitedHTTPClient struct {
