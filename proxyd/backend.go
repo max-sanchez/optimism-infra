@@ -320,8 +320,8 @@ func NewBackend(
 	rpcSemaphore *semaphore.Weighted,
 	opts ...BackendOpt,
 ) *Backend {
-	readTimeout, _ := time.ParseDuration("500ms")
-	writeTimeout, _ := time.ParseDuration("500ms")
+	readTimeout, _ := time.ParseDuration("50000ms")
+	writeTimeout, _ := time.ParseDuration("50000ms")
 	maxIdleConnDuration, _ := time.ParseDuration("1h")
 	backend := &Backend{
 		Name:            name,
@@ -619,7 +619,7 @@ func (b *Backend) doForward(ctx context.Context, rpcReqs []*RPCReq, isBatch bool
 
 	httpRes := fasthttp.AcquireResponse()
 
-	reqTimeout := time.Duration(100) * time.Millisecond
+	reqTimeout := time.Duration(5000) * time.Millisecond
 
 	err := b.fastClient.DoTimeout(req, httpRes, reqTimeout)
 	if err != nil {
