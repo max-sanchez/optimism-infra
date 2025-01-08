@@ -329,6 +329,7 @@ func NewBackend(
 		wsURL:           wsURL,
 		maxResponseSize: math.MaxInt64,
 		fastClient: &fasthttp.Client{
+			MaxConnsPerHost:               16384,
 			ReadTimeout:                   readTimeout,
 			WriteTimeout:                  writeTimeout,
 			MaxIdleConnDuration:           maxIdleConnDuration,
